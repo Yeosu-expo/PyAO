@@ -1,6 +1,5 @@
 import torch
 from torch.fx import symbolic_trace
-from fvcore.nn import FlopCountAnalysis
 from transformers import LlamaForCausalLM, AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling, GPT2Model, GPT2Tokenizer
 from huggingface_hub import login
 from collections import defaultdict
@@ -11,6 +10,7 @@ import time
 import datasets
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 
 def load_wikitext(tokenizer, collator, max_length=None, split_size=None):
     def mask_tokens(x):
@@ -47,7 +47,8 @@ def main():
 
     # 모델 및 토크나이저 로드
     print(f"Loading model {model_name}...")
-    login("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")
+    token = os.environ.get("HUG_TOKEN") or os.environ.get("HF_TOKEN")
+    login(token)
     # model = AutoModelForCausalLM.from_pretrained(opt_model, torch_dtype=torch.float16).to(device).eval()
     model = GPT2Model.from_pretrained(gpt_model, torch_dtype=torch.float16).to(device).eval()
     model.model = model
@@ -210,7 +211,7 @@ def main():
     total_layers = model_cnt if model_cnt > 0 else len(values)
     outlier_pct = (outlier_count / total_layers * 100.0) if total_layers > 0 else 0.0
 
-    with open("outliers_gpt2.txt", "w") as f:
+    with open("outliers_gpt2_tmp.txt", "w") as f:
         # Record the name of the last executed module
         f.write(f"Last module: {last_module}\n")
         f.write(f"Model Len: {model_cnt}\n")
@@ -239,7 +240,7 @@ def main():
     module_indices = list(range(len(ys)))
 
     plt.figure(figsize=(8, 4), dpi=330)
-    plt.plot(module_indices, ys, marker=',', linestyle='-', linewidth="0.7")
+    plt.plot(module_indices, ys, marker='.', linestyle='', linewidth="0.7")
 
     # 축 레이블
     plt.xlabel("Module Index")
