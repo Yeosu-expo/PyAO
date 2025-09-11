@@ -205,6 +205,11 @@ def main():
 
 
     # ── 기록: throughput 및 이상치 결과를 파일로 저장 ────────────
+    # 이상치 개수 및 퍼센티지 계산
+    outlier_count = sum(1 for v in values if v > upper_fence)
+    total_layers = model_cnt if model_cnt > 0 else len(values)
+    outlier_pct = (outlier_count / total_layers * 100.0) if total_layers > 0 else 0.0
+
     with open("outliers_gpt2.txt", "w") as f:
         # Record the name of the last executed module
         f.write(f"Last module: {last_module}\n")
@@ -217,7 +222,10 @@ def main():
         for name, value in zip(names, values):
             if value > upper_fence:
                 f.write(f"{name}: throughput={value:.6f}GB/s (upper bound: {upper_fence:.6f}GB/s)\n")
-    print("Saved outliers to outliers.txt")
+        # 파일 마지막에 outlier 수와 전체 대비 퍼센티지 기록
+        f.write("\n")
+        f.write(f"Outlier count: {outlier_count} / {total_layers} layers ({outlier_pct:.2f}%)\n")
+    print("Saved outliers to outliers_gpt2.txt")
 
     # ── Identify outlier modules by IQR on throughput ─────────────
     print("Outlier modules (IQR method):")
