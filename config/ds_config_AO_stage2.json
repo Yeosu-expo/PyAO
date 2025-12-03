@@ -26,8 +26,8 @@
             "weight_decay": 3e-7
         }
     },
-    "train_batch_size": 20,
-    "micro_batch_size_per_gpu": 4,
+    "train_batch_size": 5,
+    "micro_batch_size_per_gpu": 1,
     "gradient_accumulation_steps": 1,
     "steps_per_print": 1,
     "wall_clock_breakdown": true,

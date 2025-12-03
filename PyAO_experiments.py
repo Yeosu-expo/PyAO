@@ -3,6 +3,8 @@ import logging
 import argparse
 import time
 import uuid
+import json
+import matplotlib.pyplot as plt
 from torch.autograd.graph import saved_tensors_hooks, save_on_cpu, disable_saved_tensors_hooks
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.data.distributed import DistributedSampler
@@ -91,6 +93,59 @@ def print_gpu_mem_state(where):
     
     logger.info(f"[GPU MEM States] ({where}) Allocated = {mem/(1024**3):.4f}GB, Max Allocated = {max_mem/(1024**3):.4f}GB")
 
+
+def plot_layer_timer_graphs(names, fwd_timer, bwd_timer, save_path):
+    global logger
+
+    if not names:
+        if logger is not None:
+            logger.warning("[Layer Timer] No layers recorded; skip plotting.")
+        return
+
+    os.makedirs(save_path, exist_ok=True)
+    indices = list(range(len(names)))
+
+    def _plot(values, title, file_name):
+        fig, ax = plt.subplots(figsize=(max(8, len(names) * 0.3), 4))
+        ax.bar(indices, values)
+        ax.set_xlabel("Layer (names order)")
+        ax.set_ylabel("Time (s)")
+        ax.set_title(title)
+        ax.set_xticks(indices)
+        fig.tight_layout()
+        path = os.path.join(save_path, file_name)
+        fig.savefig(path)
+        plt.close(fig)
+        if logger is not None:
+            logger.info(f"[Layer Timer] Saved {title} graph to {path}")
+
+    fwd_values = [fwd_timer[name] for name in names]
+    bwd_values = [bwd_timer[name] for name in names]
+
+    _plot(fwd_values, "Average Forward Time", "layer_forward_time.png")
+    _plot(bwd_values, "Average Backward Time", "layer_backward_time.png")
+
+
+def save_layer_timer_stats(names, fwd_timer, bwd_timer, save_path):
+    global logger
+
+    if not names:
+        if logger is not None:
+            logger.warning("[Layer Timer] No layers recorded; skip saving stats.")
+        return
+
+    os.makedirs(save_path, exist_ok=True)
+    stats = {
+        "forward": {name: float(fwd_timer[name]) for name in names},
+        "backward": {name: float(bwd_timer[name]) for name in names},
+    }
+    output_file = os.path.join(save_path, "layer_timer_stats.json")
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
+
+    if logger is not None:
+        logger.info(f"[Layer Timer] Saved stats to {output_file}")
+
 def init_global():
     global quan_cnt, offload_event, dispatcher_uid, storage, prefetch_count, module_memory, current_module, uid, args, pre_hook_handler, post_hook_handler, model, pack_ctx, pack_ctx_for_offload, pack_ctx_for_discard, pack_ctx_for_recompute, selected_ops, cpu_refer_dict, module_sequence, prefetch_offloaded_pack, transfer_event, is_backward
     init_tracer()
@@ -150,6 +205,12 @@ def init_tracer():
     cpu_pack_dict.clear()
     input_tracer.clear()
 
+def init_timer(module_names):
+    global layer_acc_fwd_timer, layer_acc_bwd_timer
+    for name in module_names:
+        layer_acc_fwd_timer[name] = 0.0
+        layer_acc_bwd_timer[name] = 0.0
+
 current_module = None
 uid = 0
 
@@ -195,6 +256,9 @@ do_quantization = 0
 do_recompute = 0
 quantization_bits = 8
 quan_cnt = 0
+layer_timer = defaultdict(float)
+layer_acc_fwd_timer = defaultdict(float)
+layer_acc_bwd_timer = defaultdict(float)
 
 
 # -- Notes --- #
@@ -403,19 +467,22 @@ def unpack_from_cpu(packed: tuple[torch.device,torch.Tensor, bool]) -> torch.Ten
 
 # --- Full Module Hook --- #
 def pre_fwd_hook_full(module, inp):
-    global selected_ops, is_backward, do_recompute
-    
+    global selected_ops, is_backward, do_recompute, layer_timer
+
     name, is_last = get_module_name(module)
+    layer_timer[name] = time.time()
     if do_recompute == 1:
         if name in selected_ops and not is_last and not is_backward:
-            pre_fwd_hook_for_discard(module, inp)
+            pre_fwd_hook_for_discard(module, inp) # for excluded layers from offloading strategy
     else:
         pre_fwd_hook(module, inp)
 
 def post_fwd_hook_full(module, inp, out):
-    global selected_ops, do_recompute
+    global selected_ops, do_recompute, layer_timer, layer_acc_fwd_timer
 
     name, is_last = get_module_name(module)
+    layer_timer[name] = time.time() - layer_timer[name]
+    layer_acc_fwd_timer[name] += layer_timer[name]
     if do_recompute == 1:
         if name in selected_ops and not is_last and not is_backward:
             post_fwd_hook_for_discard(module, inp, out)
@@ -423,9 +490,10 @@ def post_fwd_hook_full(module, inp, out):
         post_fwd_hook(module, inp, out)
 
 def pre_bwd_hook_full(module, inp):
-    global selected_ops, do_recompute
+    global selected_ops, do_recompute, layer_timer
 
     name, is_last = get_module_name(module)
+    layer_timer[name] = time.time()
     if do_recompute == 1:
         if name in selected_ops and not is_last:
             pre_bwd_hook_for_recompute(module, inp)
@@ -433,9 +501,11 @@ def pre_bwd_hook_full(module, inp):
         pre_bwd_hook(module, inp)
 
 def post_bwd_hook_full(module, inp, out):
-    global selected_ops, do_recompute
+    global selected_ops, do_recompute, layer_timer, layer_acc_bwd_timer
 
     name, is_last = get_module_name(module)
+    layer_timer[name] = time.time() - layer_timer[name]
+    layer_acc_bwd_timer[name] += layer_timer[name]
     if do_recompute == 1:
         if name in selected_ops and not is_last:
             post_bwd_hook_for_recompute(module, inp, out)
@@ -1002,7 +1072,7 @@ def main():
     parser.add_argument("--model", "-m", type=str, default="llama",
                         help="model name. (default=Llama)(option: llama, opt)")
     parser.add_argument("--max_steps", "-s", type=int, default=1,
-                        help="최대 배치 수 (default=1)")
+                        help="최대 스텝 수 (default=1)")
     parser.add_argument("--max_length", "-l", type=int, default=1024,
                         help="sample length (default=1024)")
     parser.add_argument("--do_offload", "-o", type=int, default=0,
@@ -1043,7 +1113,7 @@ def main():
     for h in logger.handlers[:]:
         logger.removeHandler(h)
     if int(rank) == 0:
-        log_folder = "/home/deepspeed/output/logs/"
+        log_folder = "/home/deepspeed/outputs/PyAO/logs/"
     else:
         log_folder = "/root/"
     fh = logging.FileHandler(log_folder + args.log_file, mode="w")
@@ -1061,10 +1131,11 @@ def main():
     logger.info(f"Using device {device}")
 
     # DeepSpeed 설정
-    ds_config = "/home/deepspeed/config/ds_config_AO_stage2.json"
+    ds_config = "/home/deepspeed/PyAO/config/ds_config_AO_stage2.json"
 
     # Simple tensor operation with gradient
     hug_token = os.environ.get("HUG_TOKEN", "")
+    print("Hugging Face Token:", hug_token)
     login(hug_token)
     if args.model == "llama":
         modelname = "meta-llama/Llama-3.2-1B"
@@ -1094,7 +1165,7 @@ def main():
     
 
     collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
-    train_dataset = load_wikitext(tokenizer, collator, max_length=args.max_length, split_size=130)
+    train_dataset = load_wikitext(tokenizer, collator, max_length=args.max_length, split_size=50)
 
     # 엔진 초기화
     logger.info("Initializing DeepSpeed engine...")
@@ -1172,6 +1243,8 @@ def main():
 
     # -- register hooks -- #
     leaf_modules = [(name, mod) for name, mod in model_engine.module.model.named_modules() if len(list(mod.children())) == 0]
+    names = [name for name, _ in leaf_modules]
+    init_timer(names)
     for n, m in leaf_modules:
         m.register_forward_pre_hook(pre_fwd_hook_full)
         m.register_forward_hook(post_fwd_hook_full)
@@ -1282,6 +1355,17 @@ def main():
     logger.info(f"[MAIN] Training Time: {full_train_time:.4f}s, Avg/step: {avg_time:.4f}s, Peak GPU: {peak_gpu_mem/(1024**3):.4f}GB, Peak CPU: {_cpu_peak_rss/(1024**3):.4f}GB")
     nvtx.range_pop()
     torch.cuda.cudart().cudaProfilerStop()
+
+    ## Timer Results
+    global layer_acc_fwd_timer, layer_acc_bwd_timer
+    for name in names:
+        layer_acc_fwd_timer[name] /= args.max_steps
+        layer_acc_bwd_timer[name] /= args.max_steps
+    save_path_plot = os.path.join("/home", "deepspeed","outputs", "PyAO", "plots", "experiments")
+    save_path_stats = os.path.join("/home", "deepspeed","outputs", "PyAO", "stats", "experiments")
+    plot_layer_timer_graphs(names, layer_acc_fwd_timer, layer_acc_bwd_timer, save_path_plot)
+    save_layer_timer_stats(names, layer_acc_fwd_timer, layer_acc_bwd_timer, save_path_stats)
+
 
 if __name__ == "__main__":
     main()
